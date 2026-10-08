@@ -1,14 +1,15 @@
 /// *This module is available only if HDT is built with the `"cli"` feature.*
 /// Under development, parameters may change.
 use bytesize::ByteSize;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use color_eyre::Section;
 use color_eyre::config::HookBuilder;
 use color_eyre::eyre::{Report, WrapErr};
 //use log::info;
 use fs_err::{File, metadata};
-use hdt::Hdt;
 use hdt::containers::ControlInfo;
 use hdt::header::Header;
+use hdt::{Hdt, NtOptions, NulPolicy};
 use sophia::api::graph::Graph;
 use sophia::api::prelude::{TripleSerializer, TripleSource};
 //use sophia::api::prelude::Stringifier;
@@ -61,7 +62,33 @@ enum Command {
         // /// the RDF file to create, if not given it is written to stdout
         // rdf_output_path: Option<String>,
         output_path: PathBuf,
+        /// what to do with N-Triples terms containing a nul char (U+0000), which HDT cannot store
+        #[arg(long, value_enum, default_value_t = Nul::Reject)]
+        nul: Nul,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Nul {
+    /// fail
+    Reject,
+    /// drop the triple
+    Drop,
+    /// cut the term at the first nul, as hdt-cpp and rapper do
+    Truncate,
+    /// remove the nul chars
+    Strip,
+}
+
+impl From<Nul> for NulPolicy {
+    fn from(nul: Nul) -> Self {
+        match nul {
+            Nul::Reject => Self::Reject,
+            Nul::Drop => Self::Drop,
+            Nul::Truncate => Self::Truncate,
+            Nul::Strip => Self::Strip,
+        }
+    }
 }
 
 fn main() -> Result<(), Report> {
@@ -113,7 +140,7 @@ fn main() -> Result<(), Report> {
                 }
             }
         }
-        Command::Convert { input_path, output_path /* turtle*/ } => {
+        Command::Convert { input_path, output_path, nul /* turtle*/ } => {
             let t = Instant::now();
             let file = File::open(input_path.clone())
                 .with_context(|| format!("Error opening input HDT file {input_path:?}"))?;
@@ -123,8 +150,32 @@ fn main() -> Result<(), Report> {
                 Some("hdt") => {
                     Hdt::read(reader).with_context(|| format!("Error loading input HDT from {input_path:?}"))?
                 }
-                Some("nt") => Hdt::read_nt(&input_path)
-                    .with_context(|| format!("Error loading input N-Triples file from {input_path:?}"))?,
+                Some("nt") => {
+                    let options = NtOptions::default().nul_policy(nul.into());
+                    let (hdt, report) = Hdt::read_nt_with(&input_path, &options).map_err(|e| {
+                        // a nul in a literal is the one error that a --nul option can resolve
+                        let hint = (e.kind() == std::io::ErrorKind::InvalidData
+                            && e.to_string().ends_with("which HDT cannot store"))
+                        .then_some("use --nul drop, truncate or strip to convert anyway, losing data");
+                        let report = Report::new(e)
+                            .wrap_err(format!("Error loading input N-Triples file from {input_path:?}"));
+                        match hint {
+                            Some(hint) => report.suggestion(hint),
+                            None => report,
+                        }
+                    })?;
+                    if report.nul_triples > 0 {
+                        // only reachable with a lossy policy, Reject fails instead
+                        let nul = nul.to_possible_value().expect("no skipped variants");
+                        let n = report.nul_triples;
+                        eprintln!(
+                            "warning: --nul {} applied to {n} triple{} with nul chars (U+0000)",
+                            nul.get_name(),
+                            if n == 1 { "" } else { "s" }
+                        );
+                    }
+                    hdt
+                }
                 _ => {
                     panic!(
                         "Input file has unsupported or no extension, RDF format cannot be determined, aborting."
