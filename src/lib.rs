@@ -115,6 +115,8 @@ pub mod vocab;
 pub mod wasm;
 
 pub use crate::hdt::Hdt;
+#[cfg(feature = "nt")]
+pub use crate::hdt::{NtOptions, NtReport, NulPolicy};
 use containers::ControlInfo;
 use dict_sect_pfc::DictSectPFC;
 use four_sect_dict::FourSectDict;

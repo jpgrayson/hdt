@@ -14,27 +14,94 @@ use std::collections::BTreeSet;
 use std::io::{Error, ErrorKind::InvalidData};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
 pub type Result<T> = std::io::Result<T>;
 type Simd = [u64; 4];
 type Indices = Vec<Simd>;
 
+/// What to do with a triple that has a nul char (U+0000) in the value of a literal.
+///
+/// N-Triples permits U+0000 in literals, written `\u0000`, `\U00000000` or as a raw byte,
+/// but HDT cannot store it: dictionary entries are nul-terminated, so a nul would end the
+/// entry early and corrupt its front-coded neighbours. No policy is therefore lossless.
+/// hdt-cpp and rapper truncate such values silently; this crate errors unless told otherwise.
+///
+/// A nul char anywhere else, in an IRI, a blank node label, a language tag or a datatype, is
+/// not valid RDF and is always an error, whatever the policy: rewriting it would make a
+/// different identifier.
+///
+/// The lossy policies rewrite or drop triples before the dictionary is built, so terms that
+/// become equal are merged like any other duplicate. [`NtReport`] counts the affected triples.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NulPolicy {
+    /// Fail with an [`std::io::ErrorKind::InvalidData`] error showing the offending triple.
+    #[default]
+    Reject,
+    /// Drop the whole triple. Lossy.
+    Drop,
+    /// Cut each affected literal value at its first nul, keeping the closing quote and the
+    /// language tag or datatype, as hdt-cpp and rapper do. Lossy.
+    Truncate,
+    /// Remove every nul char from each affected literal value. Lossy.
+    Strip,
+}
+
+/// Options for [`Hdt::read_nt_with`] and [`Hdt::from_triples_with`].
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct NtOptions {
+    /// How to handle nul chars (U+0000) in terms, [`NulPolicy::Reject`] by default.
+    pub nul_policy: NulPolicy,
+}
+
+impl NtOptions {
+    /// Set the [`NulPolicy`].
+    #[must_use]
+    pub const fn nul_policy(mut self, nul_policy: NulPolicy) -> Self {
+        self.nul_policy = nul_policy;
+        self
+    }
+}
+
+/// What [`Hdt::read_nt_with`] and [`Hdt::from_triples_with`] did to the input beyond converting it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NtReport {
+    /// Number of input triples with a nul char in a literal, dropped or rewritten according to the [`NulPolicy`].
+    pub nul_triples: usize,
+}
+
 impl Hdt {
     /// Converts RDF N-Triples to HDT with a FourSectionDictionary with DictionarySectionPlainFrontCoding and SPO order.
     /// Literal escapes are decoded, so the dictionary holds term values, not N-Triples syntax.
-    /// All triples including nul chars (U+0000), whether written `\u0000`, `\U00000000` or as a raw byte, are dropped as the dictionary cannot store them.
+    /// Fails if a literal contains a nul char (U+0000), which HDT cannot store; see [`NulPolicy`] and [`Hdt::read_nt_with`].
     /// *This function is available only if HDT is built with the experimental `"nt"` feature.*
     /// # Example
     /// ```
     /// let hdt = hdt::Hdt::read_nt("tests/resources/empty.nt").unwrap();
     /// ```
     pub fn read_nt(f: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self::read_nt_with(f, &NtOptions::default())?.0)
+    }
+
+    /// Like [`Hdt::read_nt`], with [`NtOptions`] and an [`NtReport`] on what was dropped or rewritten.
+    /// *This function is available only if HDT is built with the experimental `"nt"` feature.*
+    /// # Example
+    /// ```
+    /// use hdt::{Hdt, NtOptions, NulPolicy};
+    /// let options = NtOptions::default().nul_policy(NulPolicy::Drop);
+    /// let (hdt, report) = Hdt::read_nt_with("tests/resources/empty.nt", &options).unwrap();
+    /// assert_eq!(report.nul_triples, 0);
+    /// ```
+    pub fn read_nt_with(f: impl AsRef<Path>, options: &NtOptions) -> Result<(Self, NtReport)> {
         let f = f.as_ref();
         let base = Id::Named(format!("file://{}", f.canonicalize()?.display()));
         let original_size = std::fs::File::open(f)?.metadata()?.len();
-        let pool = parse_nt_terms(f)?;
-        Self::from_parsed_terms(pool, &base, Some(original_size))
+        let (pool, report) = parse_nt_terms(f, options.nul_policy)?;
+        Ok((Self::from_parsed_terms(pool, &base, Some(original_size))?, report))
     }
 
     /// Builds an HDT with a FourSectionDictionary with DictionarySectionPlainFrontCoding and SPO order
@@ -43,7 +110,8 @@ impl Hdt {
     /// literals including quotes, e.g. `"example"@en` or `"123"^^<http://www.w3.org/2001/XMLSchema#integer>`,
     /// and blank nodes as `_:b1`. This is the same format that [`Hdt::triples_all`] returns.
     /// The base IRI denotes the dataset in the header.
-    /// All triples including nul chars (U+0000), whether written `\u0000`, `\U00000000` or as a raw byte, are dropped as the dictionary cannot store them.
+    /// Fails if a literal contains a nul char (U+0000), which HDT cannot store; see [`NulPolicy`] and [`Hdt::from_triples_with`].
+    /// A nul char in any other term is always an error.
     /// *This function is available only if HDT is built with the experimental `"nt"` feature.*
     /// # Example
     /// ```
@@ -51,7 +119,25 @@ impl Hdt {
     /// let hdt = hdt::Hdt::from_triples(triples, "http://example.org/mydataset").unwrap();
     /// ```
     pub fn from_triples<S: AsRef<str>>(triples: impl IntoIterator<Item = [S; 3]>, base_iri: &str) -> Result<Self> {
-        Self::from_parsed_terms(intern_terms(triples), &Id::Named(base_iri.to_owned()), None)
+        Ok(Self::from_triples_with(triples, base_iri, &NtOptions::default())?.0)
+    }
+
+    /// Like [`Hdt::from_triples`], with [`NtOptions`] and an [`NtReport`] on what was dropped or rewritten.
+    /// *This function is available only if HDT is built with the experimental `"nt"` feature.*
+    /// # Example
+    /// ```
+    /// use hdt::{Hdt, NtOptions, NulPolicy};
+    /// let triples = [["http://example.org/s", "http://example.org/p", "\"a\0b\""]];
+    /// let options = NtOptions::default().nul_policy(NulPolicy::Strip);
+    /// let (hdt, report) = Hdt::from_triples_with(triples, "http://example.org/mydataset", &options).unwrap();
+    /// assert_eq!(report.nul_triples, 1);
+    /// assert_eq!(hdt.triples_with_pattern(Some("http://example.org/s"), None, Some("\"ab\"")).count(), 1);
+    /// ```
+    pub fn from_triples_with<S: AsRef<str>>(
+        triples: impl IntoIterator<Item = [S; 3]>, base_iri: &str, options: &NtOptions,
+    ) -> Result<(Self, NtReport)> {
+        let (pool, report) = intern_terms(triples, options.nul_policy)?;
+        Ok((Self::from_parsed_terms(pool, &Id::Named(base_iri.to_owned()), None)?, report))
     }
 
     fn from_parsed_terms(pool: ParsedTerms, base: &Id, original_size: Option<u64>) -> Result<Self> {
@@ -172,25 +258,83 @@ impl ParsedTerms {
 /// that role. u32 fits: HDT ids are at most `num_strings` ≤ u32::MAX.
 type IdMap = Vec<u32>;
 
-fn is_valid_triple(s: &str, p: &str, o: &str) -> bool {
-    if s.contains('\0') || p.contains('\0') || o.contains('\0') {
-        log::warn!("invalid triple ({s},{p},{o}) with unsupported NUL characters");
-        return false;
+/// Intern one triple, applying `policy` if a literal value contains a nul char.
+///
+/// This must happen before interning: the lossy policies can make distinct terms equal,
+/// which sorting, deduplication and section assignment only handle if they never see the
+/// original. Returns `None` for a dropped triple. A clean triple, the overwhelmingly
+/// common case, costs one memchr per term and no allocation.
+fn intern_triple(
+    interner: &Interner, t: [&str; 3], policy: NulPolicy, nul_triples: &AtomicUsize,
+) -> Option<Result<[u32; 3]>> {
+    if !t.iter().any(|term| term.contains('\0')) {
+        return Some(Ok(t.map(|term| interner.get_or_intern(term))));
     }
-    true
+    nul_triples.fetch_add(1, Relaxed);
+    // a nul outside a literal value is invalid RDF, not a limit of HDT, so no policy applies to it
+    if let Some(i) = t.iter().position(|term| term.contains('\0') && !nul_only_in_literal_value(term)) {
+        return Some(Err(nul_error(
+            &t, i, "which is not valid in an IRI, blank node label, language tag or datatype",
+        )));
+    }
+    if policy == NulPolicy::Reject {
+        let i = t.iter().position(|term| term.contains('\0')).expect("a term has a nul");
+        return Some(Err(nul_error(&t, i, "which HDT cannot store")));
+    }
+    let t: [String; 3] = match policy {
+        NulPolicy::Reject => unreachable!("rejected above"),
+        NulPolicy::Drop => return None,
+        NulPolicy::Truncate => t.map(truncate_nul),
+        NulPolicy::Strip => t.map(|term| term.replace('\0', "")),
+    };
+    Some(Ok(t.each_ref().map(|term| interner.get_or_intern(term))))
+}
+
+/// Whether every nul char of `term`, in dictionary form, lies inside a literal's quotes.
+fn nul_only_in_literal_value(term: &str) -> bool {
+    term.starts_with('"')
+        && term.rfind('"').zip(term.rfind('\0')).is_some_and(|(closing_quote, last_nul)| last_nul < closing_quote)
+}
+
+/// An error showing the whole triple, so that it can be found in the input.
+fn nul_error(t: &[&str; 3], i: usize, what: &str) -> Error {
+    let show = |term: &str| {
+        let term =
+            if term.starts_with('"') || term.starts_with("_:") { term.to_owned() } else { format!("<{term}>") };
+        term.replace('\0', "\\u0000")
+    };
+    let role = ["subject", "predicate", "object"][i];
+    Error::new(
+        InvalidData,
+        format!("{} {} {} has a nul char (U+0000) in the {role}, {what}", show(t[0]), show(t[1]), show(t[2])),
+    )
+}
+
+/// Cut a literal at the first nul of its value, keeping the closing quote and any language
+/// tag or datatype, in dictionary form.
+fn truncate_nul(term: &str) -> String {
+    let Some(nul) = term.find('\0') else { return term.to_owned() };
+    let suffix = term.rfind('"').filter(|&q| q > nul).map_or("", |q| &term[q..]);
+    [&term[..nul], suffix].concat()
 }
 
 /// Intern in-memory string triples into a [`ParsedTerms`]. Single-threaded — the
 /// input is one sequential iterator, so there is no parser-level parallelism to
 /// exploit here (dictionary compression below still runs on four threads).
-fn intern_terms<S: AsRef<str>>(triples: impl IntoIterator<Item = [S; 3]>) -> ParsedTerms {
+fn intern_terms<S: AsRef<str>>(
+    triples: impl IntoIterator<Item = [S; 3]>, policy: NulPolicy,
+) -> Result<(ParsedTerms, NtReport)> {
     let interner = Interner::new();
+    let nul_triples = AtomicUsize::new(0);
     let triples: Vec<[u32; 3]> = triples
         .into_iter()
-        .filter(|t| is_valid_triple(t[0].as_ref(), t[1].as_ref(), t[2].as_ref()))
-        .map(|t| t.map(|term| interner.get_or_intern(term.as_ref())))
-        .collect();
-    ParsedTerms::new(interner, triples)
+        .enumerate()
+        .filter_map(|(i, t)| {
+            intern_triple(&interner, t.each_ref().map(AsRef::as_ref), policy, &nul_triples)
+                .map(|r| r.map_err(|e| Error::new(InvalidData, format!("triple {i}: {e}"))))
+        })
+        .collect::<Result<_>>()?;
+    Ok((ParsedTerms::new(interner, triples), NtReport { nul_triples: nul_triples.into_inner() }))
 }
 
 /// Convert a parsed/interned term pool to a dictionary and encoded triple IDs.
@@ -284,8 +428,9 @@ fn dict_string(term: &Term) -> String {
 }
 
 /// Parse N-Triples in parallel and collect terms into the interning pool + role bitsets.
-fn parse_nt_terms(path: &Path) -> Result<ParsedTerms> {
+fn parse_nt_terms(path: &Path, policy: NulPolicy) -> Result<(ParsedTerms, NtReport)> {
     let interner: Arc<Interner> = Arc::new(Interner::new());
+    let nul_triples = AtomicUsize::new(0);
     // use two threads when available parallelism cannot be determined as going to a single thread is around 38% slower
     // 16 chosen as a sane upper limit
     let num_parsers = std::cmp::min(16, thread::available_parallelism().map_or(2, std::num::NonZero::get));
@@ -299,19 +444,14 @@ fn parse_nt_terms(path: &Path) -> Result<ParsedTerms> {
                     Ok(q) => q,
                     Err(e) => return Some(Err(e)),
                 };
-                let [ss, ps, os] =
-                    [&dict_string(&q.subject.into()), q.predicate.as_str(), &dict_string(&q.object)];
-                if !is_valid_triple(ss, ps, os) {
-                    return None;
-                }
-                let triple = [interner.get_or_intern(ss), interner.get_or_intern(ps), interner.get_or_intern(os)];
-                Some(Ok(triple))
+                let t = [&dict_string(&q.subject.into()), q.predicate.as_str(), &dict_string(&q.object)];
+                intern_triple(&interner, t, policy, &nul_triples)
             })
         })
         .collect::<Result<Vec<[u32; 3]>>>()?;
 
     let interner = Arc::try_unwrap(interner).expect("interner Arc still has outstanding references");
-    Ok(ParsedTerms::new(interner, triples))
+    Ok((ParsedTerms::new(interner, triples), NtReport { nul_triples: nul_triples.into_inner() }))
 }
 
 /// Enumerate the set-bit positions (term indices) of a bitset. Uses
@@ -453,7 +593,7 @@ fn build_dict_and_id_maps(
 pub mod tests {
     use super::super::StringTriple;
     use super::super::tests::snikmeta_check;
-    use super::Hdt;
+    use super::{Hdt, NtOptions, NulPolicy};
     use crate::hdt::tests::snikmeta;
     use crate::tests::init;
     use color_eyre::Result;
@@ -487,13 +627,15 @@ pub mod tests {
         .map(|t| t.map(Arc::from))
         .into();
 
-        let from_nt = Hdt::read_nt("tests/resources/escapes.nt")?;
+        let drop = NtOptions::default().nul_policy(NulPolicy::Drop);
+        let (from_nt, report) = Hdt::read_nt_with("tests/resources/escapes.nt", &drop)?;
         assert_eq!(from_nt.triples_all().collect::<Vec<_>>(), want, "dictionary must hold decoded values");
+        assert_eq!(report.nul_triples, 6);
 
         // the same graph given as decoded strings must build the same HDT
         let mut wantmore = want.clone();
         wantmore.push(["urn:x:s", "urn:x:nul4", "\"a\u{0000}\"bc"].map(Arc::from));
-        let from_triples = Hdt::from_triples(wantmore, "urn:x:escapes")?;
+        let (from_triples, _) = Hdt::from_triples_with(wantmore, "urn:x:escapes", &drop)?;
         assert_eq!(from_triples.triple_ids_with_pattern(Some("urn:x:s"), None, Some("\"aa\"")).count(), 1);
         assert_eq!(from_triples.triples_all().collect::<Vec<_>>(), want);
         assert_eq!(from_triples.triples.bitmap_y.dict, from_nt.triples.bitmap_y.dict);
@@ -510,6 +652,118 @@ pub mod tests {
         from_nt.write(&mut buf)?;
         let again = Hdt::read(Cursor::new(buf))?.triples_all().collect::<Vec<_>>();
         assert_eq!(again, want, "HDT must preserve values");
+        Ok(())
+    }
+
+    fn write_generated(name: &str, content: &[u8]) -> Result<std::path::PathBuf> {
+        fs_err::create_dir_all("tests/resources/generated")?;
+        let path = Path::new("tests/resources/generated").join(name);
+        fs_err::write(&path, content)?;
+        Ok(path)
+    }
+
+    fn assert_nul_rejected<T: std::fmt::Debug>(r: std::io::Result<T>) -> String {
+        let e = r.expect_err("nul char must be rejected by default");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("nul char"), "{e}");
+        e.to_string()
+    }
+
+    /// HDT cannot store U+0000, so by default it is an error however it is spelled.
+    #[test]
+    fn nul_rejected_by_default() -> Result<()> {
+        init();
+        assert_nul_rejected(Hdt::read_nt("tests/resources/escapes.nt"));
+        for (name, o) in
+            [("u4", &br#""a\u0000b""#[..]), ("u8", &br#""a\U00000000b""#[..]), ("raw", &b"\"a\0b\""[..])]
+        {
+            let nt = [&b"<urn:x:s> <urn:x:p> \"ok\" .\n<urn:x:s> <urn:x:p> "[..], o, b" .\n"].concat();
+            assert_nul_rejected(Hdt::read_nt(write_generated(&format!("nul_reject_{name}.nt"), &nt)?));
+        }
+        // subject, predicate and object each go to a different dictionary section
+        for (i, bad) in
+            [["urn:x:\0", "urn:x:p", "\"o\""], ["urn:x:s", "urn:x:\0", "\"o\""], ["urn:x:s", "urn:x:p", "\"\0\""]]
+                .into_iter()
+                .enumerate()
+        {
+            let e = assert_nul_rejected(Hdt::from_triples([["urn:x:s", "urn:x:p", "\"o\""], bad], "urn:x:nul"));
+            assert!(e.starts_with("triple 1: "), "position {i}: {e}");
+        }
+        // the error shows the whole triple, with the nul visible, to find it in the input
+        let e = assert_nul_rejected(Hdt::from_triples([["urn:x:s", "urn:x:p", "\"a\0b\"@en"]], "urn:x:nul"));
+        assert_eq!(
+            e,
+            r#"triple 0: <urn:x:s> <urn:x:p> "a\u0000b"@en has a nul char (U+0000) in the object, which HDT cannot store"#
+        );
+        Ok(())
+    }
+
+    /// A nul char outside a literal value is invalid RDF, so even the lossy policies reject it
+    /// instead of making up a different identifier.
+    #[test]
+    fn nul_outside_literal_value_always_rejected() {
+        init();
+        for policy in [NulPolicy::Reject, NulPolicy::Drop, NulPolicy::Truncate, NulPolicy::Strip] {
+            let opts = NtOptions::default().nul_policy(policy);
+            for bad in [
+                ["urn:x:s\0", "urn:x:p", "\"o\""],
+                ["_:b\0", "urn:x:p", "\"o\""],
+                ["urn:x:s", "urn:x:p\0", "\"o\""],
+                ["urn:x:s", "urn:x:p", "urn:x:o\0"],
+                ["urn:x:s", "urn:x:p", "\"o\"@en\0"],
+                ["urn:x:s", "urn:x:p", "\"o\"^^<urn:x:dt\0>"],
+            ] {
+                let e = Hdt::from_triples_with([["urn:x:s", "urn:x:p", "\"ok\""], bad], "urn:x:nul", &opts)
+                    .expect_err(&format!("{policy:?} {bad:?}"));
+                assert!(e.to_string().starts_with("triple 1: "), "{policy:?} {bad:?}: {e}");
+                assert!(e.to_string().contains("not valid"), "{policy:?} {bad:?}: {e}");
+            }
+        }
+    }
+
+    /// Each lossy policy must rewrite or drop terms before interning, so that terms it makes
+    /// equal are deduplicated and the dictionary stays sorted: `"a\0b"` sorts before `"aa"`
+    /// but `"ab"` after it, and `"a\0a"` becomes a duplicate of `"aa"` under Strip.
+    #[test]
+    fn nul_lossy_policies() -> Result<()> {
+        init();
+        let nt =
+            b"<urn:x:s> <urn:x:p> \"a\\u0000b\" .\n<urn:x:s> <urn:x:p> \"aa\" .\n<urn:x:s> <urn:x:p> \"ab\" .\n\
+<urn:x:s> <urn:x:p> \"ab\\U00000000\"@en .\n<urn:x:s> <urn:x:p> \"a\0a\" .\n<urn:x:s> <urn:x:p> \"ab\"@en .\n";
+        let path = write_generated("nul_lossy.nt", nt)?;
+        let input = ["\"a\0b\"", r#""aa""#, r#""ab""#, "\"ab\0\"@en", "\"a\0a\"", "\"ab\"@en"];
+        let triples: Vec<[&str; 3]> = input.iter().map(|&o| ["urn:x:s", "urn:x:p", o]).collect();
+
+        for (policy, objects) in [
+            (NulPolicy::Drop, &[r#""aa""#, r#""ab""#, r#""ab"@en"#][..]),
+            (NulPolicy::Truncate, &[r#""a""#, r#""aa""#, r#""ab""#, r#""ab"@en"#][..]),
+            (NulPolicy::Strip, &[r#""aa""#, r#""ab""#, r#""ab"@en"#][..]),
+        ] {
+            let opts = NtOptions::default().nul_policy(policy);
+            let want_nt: Vec<StringTriple> =
+                objects.iter().map(|&o| ["urn:x:s", "urn:x:p", o].map(Arc::from)).collect();
+
+            let (from_nt, report) = Hdt::read_nt_with(&path, &opts)?;
+            assert_eq!(report.nul_triples, 3, "{policy:?}");
+            let (from_mem, report) = Hdt::from_triples_with(triples.clone(), "urn:x:nul", &opts)?;
+            assert_eq!(report.nul_triples, 3, "{policy:?}");
+
+            let mut buf = Vec::<u8>::new();
+            from_mem.write(&mut buf)?;
+            let reread = Hdt::read(Cursor::new(buf))?;
+
+            for (hdt, want, what) in [
+                (&from_nt, &want_nt, "read_nt_with"),
+                (&from_mem, &want_nt, "from_triples_with"),
+                (&reread, &want_nt, "reread"),
+            ] {
+                assert_eq!(hdt.triples_all().collect::<Vec<_>>(), *want, "{policy:?} {what}");
+                for [s, p, o] in want {
+                    let found: Vec<_> = hdt.triples_with_pattern(Some(s), None, Some(o)).collect();
+                    assert_eq!(found, [[s.clone(), p.clone(), o.clone()]], "{policy:?} {what} lookup {o}");
+                }
+            }
+        }
         Ok(())
     }
 
