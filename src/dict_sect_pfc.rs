@@ -367,6 +367,7 @@ impl DictSectPFC {
 
         for (i, term) in terms.into_iter().enumerate() {
             let term_bytes: &[u8] = term.as_bytes();
+            debug_assert!(!term.contains('\0'), "PFC term {term:?} contains a nul char");
             if i % block_size == 0 {
                 offsets.push(compressed_terms.len());
                 compressed_terms.extend_from_slice(term_bytes);
